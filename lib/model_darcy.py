@@ -1,87 +1,107 @@
 import torch
 import torch.nn as nn
-import math
 
-''' ------------------------- baselines -------------------------- '''
+from lib.arch_utils import (
+    BaseDCON as _UnifiedBaseDCON,
+    BaseGANO as _UnifiedBaseGANO,
+    BaseNeuralOperator,
+    DCONBlendMixin,
+    DomainGeometry,
+    DomainGeometryOtherEmbedding,
+    build_mlp,
+    build_sequential_layers,
+)
 
-# physics-informed DCON
-class PI_DCON(nn.Module):
+'''
+Physics-informed neural operator models for 2D Darcy flow problem on variable domain geometries.
+
+Refactored with class hierarchy to reduce code duplication following PI-DCON/Main/models.py patterns.
+
+- Darcy: predicts a scalar field u(x, y)
+- Uses masked max-pooling for variable-size boundary inputs
+- Supports various geometry-aware coupling strategies
+'''
+
+class BaseDCON(_UnifiedBaseDCON):
+    """Compatibility wrapper for Darcy: scalar field_dim=1, par_dim=3."""
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(field_dim=1, config=config, par_dim=3)
 
-        # branch network
-        trunk_layers = [nn.Linear(3, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+    def _zip(self, xy, par, par_flag, enc=None):
+        # Keep the historical Darcy signature (no explicit axis)
+        return super()._zip(xy, par, par_flag, axis=0, enc=enc)
 
-        # trunk network 1
-        self.FC1u = nn.Linear(2, config['model']['fc_dim'])
-        self.FC2u = nn.Linear(config['model']['fc_dim'], config['model']['fc_dim'])
-        self.FC3u = nn.Linear(config['model']['fc_dim'], config['model']['fc_dim'])
-        self.FC4u = nn.Linear(config['model']['fc_dim_branch'], 1)
-        self.act = nn.Tanh()
 
-        
+class BaseGANO(_UnifiedBaseGANO):
+    """Compatibility wrapper for Darcy GANO: field_dim=1, par_dim=3."""
+
+    def __init__(self, config):
+        super().__init__(field_dim=1, config=config, par_dim=3)
+
+    def _zip(self, xy_global, par, par_flag, enc=None):
+        # Keep Darcy signature (no explicit axis)
+        return super()._zip(xy_global, par, par_flag, axis=0, enc=enc)
+
+
+# ============================================================================
+# Baseline Models
+# ============================================================================
+
+''' ------------------------- PI-DCON -------------------------- '''
+
+class PI_DCON(BaseDCON):
+    """Physics-informed DCON baseline for Darcy flow.
+    
+    Uses masked max-pooling over boundary conditions and gated modulation
+    in trunk network. Does not use geometry encoder.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        # All layers inherited from BaseDCON
+
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        model input:
+            x_coor (B, M): x-axis coordinates of the collocation points
+            y_coor (B, M): y-axis coordinates of the collocation points
+            par (B, M', 3): boundary coordinates and function values (x, y, u)
+            par_flag (B, M'): valid flags for boundary points
+            shape_coor: (B, M'', 2) - not used in DCON
+            shape_flag: (B, M'') - not used in DCON
 
-        return u: (B, M)
+        model output:
+            u (B, M): scalar field values over the domain
         '''
-
-        # get the first kernel
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
-
-        # concat coors
+        # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # predict u
-        u = self.FC1u(xy)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
+        # Predict using unified _zip method
+        u = self._zip(xy, par, par_flag)
 
         return u
 
-# physics-informed pointNet
-class PI_PN(nn.Module):
+
+''' ------------------------- PI-PN -------------------------- '''
+
+class PI_PN(BaseNeuralOperator):
+    """Physics-informed PointNet baseline"""
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
         # encoder network
-        trunk_layers = [nn.Linear(3, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.encoder = nn.Sequential(*trunk_layers)
+        self.encoder = nn.Sequential(*build_mlp(3, self.fc_dim, self.n_layer, self.fc_dim))
 
         # decoder network
-        trunk_layers = [nn.Linear(2 * config['model']['fc_dim'], config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], 1))
-        self.decoder = nn.Sequential(*trunk_layers)
-        
+        self.decoder = nn.Sequential(*build_mlp(2 * self.fc_dim, self.fc_dim, self.n_layer, 1))
+
+
     def forward(self, x_coor, y_coor, par, par_flag):
         '''
-        par: (B, M)
+        par: (B, M', 3)
+        par_flag: (B, M')
         x_coor: (B, M)
         y_coor: (B, M)
 
@@ -103,31 +123,24 @@ class PI_PN(nn.Module):
 
         return u
 
-# physics-informed pointNet for fixed PDE parameters
-class PI_PN_only_geo(nn.Module):
+
+class PI_PN_only_geo(BaseNeuralOperator):
+    """Physics-informed PointNet for fixed PDE parameters (geometry-only)"""
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
         # encoder network
-        trunk_layers = [nn.Linear(2, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.encoder = nn.Sequential(*trunk_layers)
+        self.encoder = nn.Sequential(*build_mlp(2, self.fc_dim, self.n_layer, self.fc_dim))
 
         # decoder network
-        trunk_layers = [nn.Linear(2 * config['model']['fc_dim'], config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], 1))
-        self.decoder = nn.Sequential(*trunk_layers)
-        
+        self.decoder = nn.Sequential(*build_mlp(2 * self.fc_dim, self.fc_dim, self.n_layer, 1))
+
+
     def forward(self, x_coor, y_coor, par, par_flag):
         '''
-        par: (B, M)
+        par: (B, M', 3)
+        par_flag: (B, M')
         x_coor: (B, M)
         y_coor: (B, M)
 
@@ -149,352 +162,241 @@ class PI_PN_only_geo(nn.Module):
 
         return u
 
-''' ------------------------- PI-GANO -------------------------- '''
 
-class DG(nn.Module):
+# ============================================================================
+# PI-GANO Main Architecture
+# ============================================================================
 
-    def __init__(self, config):
-        super().__init__()
+''' ------------------------- PI-GANO (concatenation coupling) -------------------------- '''
 
-        # branch network
-        trunk_layers = [nn.Linear(2, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
-        
-    def forward(self, shape_coor, shape_flag):
-        '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
-
-        return u: (B, M)
-        '''
-
-        # get the first kernel
-        enc = self.branch(shape_coor)    # (B, M, F)
-        enc_masked = enc * shape_flag.unsqueeze(-1)    # (B, M, F)
-        Domain_enc = torch.sum(enc_masked, 1, keepdim=True) / torch.sum(shape_flag.unsqueeze(-1), 1, keepdim=True)    # (B, 1, F)
-
-        return Domain_enc
-
-class PI_GANO(nn.Module):
+class PI_GANO(BaseGANO):
+    """
+    Physics-Informed Geometry-Aware Neural Operator with concatenation coupling.
+    Main GANO architecture proposed in the paper.
+    
+    Uses domain geometry encoder + coordinate lifting + concatenation coupling.
+    """
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
-        # define the geometry encoder
-        self.DG = DG(config)
+        # Branch network (2*fc_dim for concatenated features)
+        self.branch = nn.Sequential(*build_mlp(3, 2*self.fc_dim, self.n_layer, 2*self.fc_dim))
 
-        # branch network
-        trunk_layers = [nn.Linear(3, 2*config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+        # Coordinate lifting layer
+        self.xy_lift = nn.Linear(2, self.fc_dim)
 
-        # trunk network 1
-        self.xy_lift = nn.Linear(2, config['model']['fc_dim'])
-        self.FC1u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC2u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC3u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC4u = nn.Linear(2*config['model']['fc_dim'], 1)
-        self.act = nn.Tanh()
-        
+        # Trunk network (operates on 2*fc_dim concatenated features)
+        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+
+
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        model input:
+            x_coor (B, M): x-axis coordinates of the collocation points
+            y_coor (B, M): y-axis coordinates of the collocation points
+            par (B, M', 3): boundary coordinates and function values (x, y, u)
+            par_flag (B, M'): valid flags for boundary points
+            shape_coor (B, M'', 2): domain boundary shape coordinates
+            shape_flag (B, M''): valid flags for shape points
 
-        return u: (B, M)
+        model output:
+            u (B, M): scalar field values over the domain
         '''
+        # Forward to get the domain embedding
+        Domain_enc = self._encode_geometry(shape_coor, shape_flag)    # (B,1,F)
 
-        # extract number of points
-        B, mD = x_coor.shape
-
-        # forward to get the domain embedding
-        Domain_enc = self.DG(shape_coor, shape_flag)    # (B,1,F)
-
-        # concat coors
+        # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # lift the dimension of coordinate embedding
+        # Lift the dimension of coordinate embedding
         xy_local = self.xy_lift(xy)   # (B,M,F)
 
-        # combine with global embedding
-        xy_global = torch.cat((xy_local, Domain_enc.repeat(1,mD,1)), -1)    # (B,M,2F)
+        # Combine with global embedding (concatenation)
+        xy_global = self._combine_embeddings(xy_local, Domain_enc, coupling='concat')    # (B,M,2F)
 
-        # get the kernels
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
+        # Predict using unified _zip method
+        u = self._zip(xy_global, par, par_flag)
 
-        # predict u
-        u = self.FC1u(xy_global)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
-        
         return u
 
-''' ------------------------- study of geometry embedding -------------------------- '''
 
-class DG_other_embedding(nn.Module):
+''' ------------------------- PI-GANO variants with different coupling -------------------------- '''
 
-    def __init__(self, config):
-        super().__init__()
-
-        # branch network
-        trunk_layers = [nn.Linear(2, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], 2 * config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
-        
-    def forward(self, shape_coor, shape_flag):
-        '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
-
-        return u: (B, M)
-        '''
-
-        # get the first kernel
-        enc = self.branch(shape_coor)    # (B, M, F)
-        enc_masked = enc * shape_flag.unsqueeze(-1)    # (B, M, F)
-        Domain_enc = torch.sum(enc_masked, 1, keepdim=True) / torch.sum(shape_flag.unsqueeze(-1), 1, keepdim=True)    # (B, 1, F)
-
-        return Domain_enc
-
-# Use addition as feature coupling
-class PI_GANO_add(nn.Module):
+class PI_GANO_add(BaseGANO):
+    """PI-GANO with addition coupling for feature fusion.
+    
+    Uses element-wise addition to combine local coordinates with global geometry.
+    """
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
-        
-        self.DG = DG_other_embedding(config)
+        # Use alternative geometry encoder with 2*fc_dim output
+        self.DG = DomainGeometryOtherEmbedding(config)
 
-        # branch network
-        trunk_layers = [nn.Linear(3, 2*config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+        # Branch network
+        self.branch = nn.Sequential(*build_mlp(3, 2*self.fc_dim, self.n_layer, 2*self.fc_dim))
 
-        # trunk network 1
-        self.xy_lift = nn.Linear(2, 2*config['model']['fc_dim'])
-        self.FC1u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC2u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC3u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC4u = nn.Linear(2*config['model']['fc_dim'], 1)
-        self.act = nn.Tanh()
-        
+        # Coordinate lifting layer (to 2F for addition)
+        self.xy_lift = nn.Linear(2, 2*self.fc_dim)
+
+        # Trunk network
+        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+
+
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        model input:
+            x_coor (B, M): x-axis coordinates of the collocation points
+            y_coor (B, M): y-axis coordinates of the collocation points
+            par (B, M', 3): boundary coordinates and function values (x, y, u)
+            par_flag (B, M'): valid flags for boundary points
+            shape_coor (B, M'', 2): domain boundary shape coordinates
+            shape_flag (B, M''): valid flags for shape points
 
-        return u: (B, M)
+        model output:
+            u (B, M): scalar field values over the domain
         '''
+        # Forward to get the domain embedding
+        Domain_enc = self._encode_geometry(shape_coor, shape_flag)    # (B,1,2F)
 
-        # extract number of points
-        B, mD = x_coor.shape
-
-        # forward to get the domain embedding
-        Domain_enc = self.DG(shape_coor, shape_flag)    # (B,1,F)
-
-        # concat coors
+        # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # lift the dimension of coordinate embedding
-        xy_local = self.xy_lift(xy)   # (B,M,F)
+        # Lift the dimension of coordinate embedding
+        xy_local = self.xy_lift(xy)   # (B,M,2F)
 
-        # combine with global embedding
-        xy_global = xy_local + Domain_enc.repeat(1,mD,1)    # (B,M,2F)
+        # Combine with global embedding (addition)
+        xy_global = self._combine_embeddings(xy_local, Domain_enc, coupling='add')    # (B,M,2F)
 
-        # get the kernels
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
+        # Predict using unified _zip method
+        u = self._zip(xy_global, par, par_flag)
 
-        # predict u
-        u = self.FC1u(xy_global)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
-        
         return u
 
-# Use elementwise multiplication as feature coupling
-class PI_GANO_mul(nn.Module):
+
+class PI_GANO_mul(BaseGANO):
+    """PI-GANO with element-wise multiplication coupling for feature fusion.
+    
+    Uses element-wise multiplication to combine local coordinates with global geometry.
+    """
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
-        
-        self.DG = DG_other_embedding(config)
+        # Use alternative geometry encoder with 2*fc_dim output
+        self.DG = DomainGeometryOtherEmbedding(config)
 
-        # branch network
-        trunk_layers = [nn.Linear(3, 2*config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+        # Branch network
+        self.branch = nn.Sequential(*build_mlp(3, 2*self.fc_dim, self.n_layer, 2*self.fc_dim))
 
-        # trunk network 1
-        self.xy_lift = nn.Linear(2, 2*config['model']['fc_dim'])
-        self.FC1u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC2u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC3u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC4u = nn.Linear(2*config['model']['fc_dim'], 1)
-        self.act = nn.Tanh()
-        
+        # Coordinate lifting layer (to 2F for multiplication)
+        self.xy_lift = nn.Linear(2, 2*self.fc_dim)
+
+        # Trunk network
+        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+
+
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        model input:
+            x_coor (B, M): x-axis coordinates of the collocation points
+            y_coor (B, M): y-axis coordinates of the collocation points
+            par (B, M', 3): boundary coordinates and function values (x, y, u)
+            par_flag (B, M'): valid flags for boundary points
+            shape_coor (B, M'', 2): domain boundary shape coordinates
+            shape_flag (B, M''): valid flags for shape points
 
-        return u: (B, M)
+        model output:
+            u (B, M): scalar field values over the domain
         '''
+        # Forward to get the domain embedding
+        Domain_enc = self._encode_geometry(shape_coor, shape_flag)    # (B,1,2F)
 
-        # extract number of points
-        B, mD = x_coor.shape
-
-        # forward to get the domain embedding
-        Domain_enc = self.DG(shape_coor, shape_flag)    # (B,1,F)
-
-        # concat coors
+        # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # lift the dimension of coordinate embedding
-        xy_local = self.xy_lift(xy)   # (B,M,F)
+        # Lift the dimension of coordinate embedding
+        xy_local = self.xy_lift(xy)   # (B,M,2F)
 
-        # combine with global embedding
-        xy_global = xy_local * Domain_enc.repeat(1,mD,1)    # (B,M,2F)
+        # Combine with global embedding (multiplication)
+        xy_global = self._combine_embeddings(xy_local, Domain_enc, coupling='mul')    # (B,M,2F)
 
-        # get the kernels
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
+        # Predict using unified _zip method
+        u = self._zip(xy_global, par, par_flag)
 
-        # predict u
-        u = self.FC1u(xy_global)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
-        
         return u
 
-''' ------------------------- boundary embedding -------------------------- '''
 
-# use high-level feature parameters to represent domain geometry
-class PI_GANO_geo(nn.Module):
+class PI_GANO_geo(DCONBlendMixin, BaseNeuralOperator):
+    """
+    PI-GANO variant using high-level geometric features instead of point clouds.
+    Uses parametric geometry representation (e.g., shape parameters) as input.
+    """
 
     def __init__(self, config, geo_feature_dim):
-        super().__init__()
+        super().__init__(config)
 
-        
-        # branch network
-        trunk_layers = [nn.Linear(geo_feature_dim, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.geo_encoder = nn.Sequential(*trunk_layers)
+        # Geometry encoder from high-level features
+        self.geo_encoder = nn.Sequential(*build_mlp(geo_feature_dim, self.fc_dim, self.n_layer, self.fc_dim))
 
-        # branch network
-        trunk_layers = [nn.Linear(3, 2*config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+        # Branch network
+        self.branch = nn.Sequential(*build_mlp(3, 2*self.fc_dim, self.n_layer, 2*self.fc_dim))
 
-        # trunk network 1
-        self.xy_lift = nn.Linear(2, config['model']['fc_dim'])
-        self.FC1u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC2u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC3u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC4u = nn.Linear(2*config['model']['fc_dim'], 1)
+        # Coordinate lifting layer
+        self.xy_lift = nn.Linear(2, self.fc_dim)
+
+        # Trunk network
+        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+
+        # Activation
         self.act = nn.Tanh()
-        
+
+    def _encode_par(self, par, par_flag):
+        """Compute the parameter encoding from branch network."""
+        enc = self.branch(par)
+        enc_masked = enc * par_flag.unsqueeze(-1)
+        enc = torch.amax(enc_masked, 1, keepdim=True)
+        return enc
+
     def forward(self, x_coor, y_coor, par, par_flag, geo_feature):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        model input:
+            x_coor (B, M): x-axis coordinates of the collocation points
+            y_coor (B, M): y-axis coordinates of the collocation points
+            par (B, M', 3): boundary coordinates and function values (x, y, u)
+            par_flag (B, M'): valid flags for boundary points
+            geo_feature (B, geo_feature_dim): high-level geometric features
 
-        return u: (B, M)
+        model output:
+            u (B, M): scalar field values over the domain
         '''
-
-        # extract number of points
+        # Extract number of points
         B, mD = x_coor.shape
 
-        # forward to get the domain embedding
+        # Forward to get the domain embedding from high-level features
         Domain_enc = self.geo_encoder(geo_feature).unsqueeze(1)    # (B,1,F)
 
-        # concat coors
+        # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # lift the dimension of coordinate embedding
+        # Lift the dimension of coordinate embedding
         xy_local = self.xy_lift(xy)   # (B,M,F)
 
-        # combine with global embedding
+        # Combine with global embedding (concatenation)
         xy_global = torch.cat((xy_local, Domain_enc.repeat(1,mD,1)), -1)    # (B,M,2F)
 
-        # get the kernels
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
+        # Get the kernels
+        enc = self._encode_par(par, par_flag)
 
-        # predict u
-        u = self.FC1u(xy_global)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
-        
+        # Predict u using mixin method
+        u = self._predict_head(xy_global, enc, self.FC)
+
         return u
 
-''' ------------------------- New model -------------------------- '''
+
+''' ------------------------- New model template -------------------------- '''
 
 class New_model_darcy(nn.Module):
 
@@ -507,9 +409,8 @@ class New_model_darcy(nn.Module):
         par_flag: (B, M')
         x_coor: (B, M)
         y_coor: (B, M)
-        z_coor: (B, M)
 
         return u: (B, M)
         '''
-        
+
         return None
