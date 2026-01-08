@@ -138,7 +138,7 @@ class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
         par_dim: boundary input dimension (e.g., 3 for Darcy, 4 for Plate)
     """
 
-    def __init__(self, field_dim, config, par_dim):
+    def __init__(self, field_dim, config, par_dim=3):
         super().__init__(config)
         if field_dim not in (1, 2):
             raise ValueError(f"field_dim must be 1 or 2, got {field_dim}")
@@ -156,12 +156,13 @@ class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
 
         self.act = nn.Tanh()
 
-    def _encode_par(self, par, par_flag):
+    def _encode_par(self, par, par_flag=None):
         enc = self.branch(par)
-        enc_masked = enc * par_flag.unsqueeze(-1)
-        return torch.amax(enc_masked, 1, keepdim=True)
+        if par_flag is not None:
+            enc = enc * par_flag.unsqueeze(-1)
+        return torch.amax(enc, 1, keepdim=True)
 
-    def _zip(self, xy, par, par_flag, axis=0, enc=None):
+    def _zip(self, xy, par, axis=0, enc=None, par_flag=None):
         if enc is None:
             enc = self._encode_par(par, par_flag)
         return self._predict_head(xy, enc, self.FC[axis])
@@ -238,8 +239,9 @@ class BaseGANO(DCONBlendMixin, BaseNeuralOperator):
     Subclasses are expected to define:
     - `self.branch`: boundary/parameter encoder network
     - `self.FC`: trunk layers
-        - if field_dim == 1: `self.FC` is a sequence of Linear layers
-        - if field_dim == 2: `self.FC` is a sequence of sequences (per component)
+                - always: a sequence of sequences (per component), i.e. `self.FC[axis]` are the
+                    ordered Linear layers for that component. For scalar fields, use a length-1
+                    outer sequence and always index with axis=0.
     - any coordinate lifting layers (optional)
     """
 
@@ -279,10 +281,8 @@ class BaseGANO(DCONBlendMixin, BaseNeuralOperator):
         if enc is None:
             enc = self._encode_par(par, par_flag)
 
-        if self.field_dim == 1:
-            fcs = self.FC
-        else:
-            fcs = self.FC[axis]
+        # Unified shape: self.FC is always per-component.
+        fcs = self.FC[axis]
 
         # Legacy plate-GANO applies enc-gating after the first two layers,
         # then applies a final gate before reducing.

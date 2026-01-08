@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from lib.arch_utils import (
+from lib.model_base import (
     BaseDCON as _UnifiedBaseDCON,
     BaseGANO as _UnifiedBaseGANO,
     BaseNeuralOperator,
@@ -29,7 +29,7 @@ class BaseDCON_plate(_UnifiedBaseDCON):
         super().__init__(field_dim=2, config=config, par_dim=4)
 
     def _zip(self, xy, par, par_flag, axis, enc=None):
-        return super()._zip(xy, par, par_flag, axis=axis, enc=enc)
+        return super()._zip(xy, par, axis=axis, enc=enc, par_flag=par_flag)
 
 
 class BaseGANO(_UnifiedBaseGANO):
@@ -39,7 +39,7 @@ class BaseGANO(_UnifiedBaseGANO):
         super().__init__(field_dim=2, config=config, par_dim=4)
 
     def _zip(self, xy_global, par, par_flag, axis, enc=None):
-        return super()._zip(xy_global, par, par_flag, axis=axis, enc=enc)
+        return super()._zip(xy_global, par, axis=axis, enc=enc, par_flag=par_flag)
 
 
 # ============================================================================

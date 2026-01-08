@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from lib.arch_utils import (
+from lib.model_base import (
     BaseDCON as _UnifiedBaseDCON,
     BaseGANO as _UnifiedBaseGANO,
     BaseNeuralOperator,
@@ -30,7 +30,7 @@ class BaseDCON(_UnifiedBaseDCON):
 
     def _zip(self, xy, par, par_flag, enc=None):
         # Keep the historical Darcy signature (no explicit axis)
-        return super()._zip(xy, par, par_flag, axis=0, enc=enc)
+        return super()._zip(xy, par, axis=0, enc=enc, par_flag=par_flag)
 
 
 class BaseGANO(_UnifiedBaseGANO):
@@ -41,7 +41,7 @@ class BaseGANO(_UnifiedBaseGANO):
 
     def _zip(self, xy_global, par, par_flag, enc=None):
         # Keep Darcy signature (no explicit axis)
-        return super()._zip(xy_global, par, par_flag, axis=0, enc=enc)
+        return super()._zip(xy_global, par, axis=0, enc=enc, par_flag=par_flag)
 
 
 # ============================================================================
@@ -187,7 +187,9 @@ class PI_GANO(BaseGANO):
         self.xy_lift = nn.Linear(2, self.fc_dim)
 
         # Trunk network (operates on 2*fc_dim concatenated features)
-        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3)),
+        ])
 
 
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
@@ -242,7 +244,9 @@ class PI_GANO_add(BaseGANO):
         self.xy_lift = nn.Linear(2, 2*self.fc_dim)
 
         # Trunk network
-        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3)),
+        ])
 
 
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
@@ -295,7 +299,9 @@ class PI_GANO_mul(BaseGANO):
         self.xy_lift = nn.Linear(2, 2*self.fc_dim)
 
         # Trunk network
-        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3)),
+        ])
 
 
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
@@ -348,7 +354,9 @@ class PI_GANO_geo(DCONBlendMixin, BaseNeuralOperator):
         self.xy_lift = nn.Linear(2, self.fc_dim)
 
         # Trunk network
-        self.FC = nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3))
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2*self.fc_dim, 2*self.fc_dim, 3)),
+        ])
 
         # Activation
         self.act = nn.Tanh()
@@ -391,7 +399,7 @@ class PI_GANO_geo(DCONBlendMixin, BaseNeuralOperator):
         enc = self._encode_par(par, par_flag)
 
         # Predict u using mixin method
-        u = self._predict_head(xy_global, enc, self.FC)
+        u = self._predict_head(xy_global, enc, self.FC[0])
 
         return u
 
